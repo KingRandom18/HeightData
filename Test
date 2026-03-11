@@ -1,0 +1,228 @@
+import express from "express";
+import dotenv from "dotenv";
+import { PNG } from "pngjs";
+
+dotenv.config();
+
+const app = express();
+const PORT = Number(process.env.PORT || 3000);
+const MAPBOX_TOKEN = process.env.MAPBOX_TOKEN;
+
+if (!MAPBOX_TOKEN) {
+  throw new Error("Missing MAPBOX_TOKEN in environment variables.");
+}
+
+/*
+  Settings:
+  - scale=1 means 1 km
+  - pointsPerKm=10 means 10 samples per km
+*/
+const DEFAULT_POINTS_PER_KM = 10;
+const TILE_ZOOM = 14; // good starter zoom for terrain detail
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function degToRad(deg) {
+  return (deg * Math.PI) / 180;
+}
+
+/*
+  Approximate meters per degree at a given latitude.
+  Good enough for a terrain sampling box.
+*/
+function metersPerDegreeLat() {
+  return 111320;
+}
+
+function metersPerDegreeLon(lat) {
+  return 111320 * Math.cos(degToRad(lat));
+}
+
+/*
+  Build a square bounding box centered on lat/lon.
+  scaleKm = width/height in kilometers.
+*/
+function makeBoundingBox(lat, lon, scaleKm) {
+  const halfMeters = (scaleKm * 1000) / 2;
+  const latDelta = halfMeters / metersPerDegreeLat();
+  const lonDelta = halfMeters / metersPerDegreeLon(lat);
+
+  return {
+    minLat: lat - latDelta,
+    maxLat: lat + latDelta,
+    minLon: lon - lonDelta,
+    maxLon: lon + lonDelta
+  };
+}
+
+/*
+  Standard slippy-map fractional tile coordinates.
+  Mapbox uses x/y tile numbering, not lat/lon directly.
+*/
+function lonToTileX(lon, zoom) {
+  const n = 2 ** zoom;
+  return ((lon + 180) / 360) * n;
+}
+
+function latToTileY(lat, zoom) {
+  const latRad = degToRad(lat);
+  const n = 2 ** zoom;
+  return (
+    (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2
+  ) * n;
+}
+
+/*
+  Mapbox Terrain-RGB decode formula:
+  height = -10000 + ((R * 256 * 256 + G * 256 + B) * 0.1)
+*/
+function decodeTerrainRgb(r, g, b) {
+  return -10000 + ((r * 256 * 256 + g * 256 + b) * 0.1);
+}
+
+/*
+  In-memory tile cache for prototype use.
+  Key = z/x/y
+*/
+const tileCache = new Map();
+
+async function fetchTilePng(z, x, y) {
+  const key = `${z}/${x}/${y}`;
+  if (tileCache.has(key)) {
+    return tileCache.get(key);
+  }
+
+  const url = `https://api.mapbox.com/v4/mapbox.terrain-rgb/${z}/${x}/${y}.pngraw?access_token=${MAPBOX_TOKEN}`;
+  const response = await fetch(url);
+
+  if (!response.ok) {
+    throw new Error(`Failed tile fetch ${key}: ${response.status} ${response.statusText}`);
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const png = PNG.sync.read(Buffer.from(arrayBuffer));
+
+  tileCache.set(key, png);
+  return png;
+}
+
+async function getElevationAt(lat, lon, zoom) {
+  const tileXFloat = lonToTileX(lon, zoom);
+  const tileYFloat = latToTileY(lat, zoom);
+
+  const tileX = Math.floor(tileXFloat);
+  const tileY = Math.floor(tileYFloat);
+
+  const png = await fetchTilePng(zoom, tileX, tileY);
+
+  const pxFloat = (tileXFloat - tileX) * png.width;
+  const pyFloat = (tileYFloat - tileY) * png.height;
+
+  const px = clamp(Math.floor(pxFloat), 0, png.width - 1);
+  const py = clamp(Math.floor(pyFloat), 0, png.height - 1);
+
+  const idx = (png.width * py + px) * 4;
+  const r = png.data[idx];
+  const g = png.data[idx + 1];
+  const b = png.data[idx + 2];
+
+  return decodeTerrainRgb(r, g, b);
+}
+
+async function buildHeightGrid(lat, lon, scaleKm, pointsPerKm, zoom) {
+  const bbox = makeBoundingBox(lat, lon, scaleKm);
+
+  const sampleCount = Math.max(2, Math.round(scaleKm * pointsPerKm));
+  const heights = [];
+
+  for (let row = 0; row < sampleCount; row++) {
+    const rowHeights = [];
+    const tLat = sampleCount === 1 ? 0 : row / (sampleCount - 1);
+    const sampleLat = bbox.maxLat + (bbox.minLat - bbox.maxLat) * tLat;
+
+    for (let col = 0; col < sampleCount; col++) {
+      const tLon = sampleCount === 1 ? 0 : col / (sampleCount - 1);
+      const sampleLon = bbox.minLon + (bbox.maxLon - bbox.minLon) * tLon;
+
+      const h = await getElevationAt(sampleLat, sampleLon, zoom);
+      rowHeights.push(Math.round(h * 10) / 10);
+    }
+
+    heights.push(rowHeights);
+  }
+
+  return {
+    bbox,
+    sampleCount,
+    heights
+  };
+}
+
+app.get("/", (_req, res) => {
+  res.json({
+    ok: true,
+    message: "Roblox Terrain API running"
+  });
+});
+
+app.get("/terrain", async (req, res) => {
+  try {
+    const lat = Number(req.query.lat);
+    const lon = Number(req.query.lon);
+    const scale = Number(req.query.scale || 1);
+    const pointsPerKm = Number(req.query.pointsPerKm || DEFAULT_POINTS_PER_KM);
+
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return res.status(400).json({ error: "lat and lon must be valid numbers" });
+    }
+
+    if (!Number.isFinite(scale) || scale <= 0) {
+      return res.status(400).json({ error: "scale must be a positive number" });
+    }
+
+    if (!Number.isFinite(pointsPerKm) || pointsPerKm <= 0) {
+      return res.status(400).json({ error: "pointsPerKm must be a positive number" });
+    }
+
+    const safeLat = clamp(lat, -85, 85);
+    const safeLon = ((lon + 180) % 360 + 360) % 360 - 180;
+    const safeScale = clamp(scale, 0.25, 20);
+    const safePointsPerKm = clamp(pointsPerKm, 2, 50);
+
+    const result = await buildHeightGrid(
+      safeLat,
+      safeLon,
+      safeScale,
+      safePointsPerKm,
+      TILE_ZOOM
+    );
+
+    res.json({
+      ok: true,
+      center: {
+        lat: safeLat,
+        lon: safeLon
+      },
+      scaleKm: safeScale,
+      pointsPerKm: safePointsPerKm,
+      zoom: TILE_ZOOM,
+      bbox: result.bbox,
+      sampleCount: result.sampleCount,
+      heights: result.heights
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({
+      ok: false,
+      error: "Failed to generate terrain data",
+      details: error.message
+    });
+  }
+});
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
