@@ -1,24 +1,24 @@
 import express from "express";
 import dotenv from "dotenv";
-import { PNG } from "pngjs";
+import * as GeoTIFF from "geotiff";
 
 dotenv.config();
 
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
-const MAPBOX_TOKEN = process.env.MAPBOX_TOKEN;
+const OPENTOPOGRAPHY_API_KEY = process.env.OPENTOPOGRAPHY_API_KEY;
 
-if (!MAPBOX_TOKEN) {
-  throw new Error("Missing MAPBOX_TOKEN in environment variables.");
+if (!OPENTOPOGRAPHY_API_KEY) {
+  throw new Error("Missing OPENTOPOGRAPHY_API_KEY in environment variables.");
 }
 
-/*
-  Settings:
-  - scale=1 means 1 km
-  - pointsPerKm=10 means 10 samples per km
-*/
 const DEFAULT_POINTS_PER_KM = 10;
-const TILE_ZOOM = 14; // good starter zoom for terrain detail
+
+// Pick a DEM source.
+// Good starter choice:
+// SRTMGL3 = coarser global
+// SRTMGL1 = finer where available
+const DEFAULT_DEM = "SRTMGL1";
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -28,10 +28,6 @@ function degToRad(deg) {
   return (deg * Math.PI) / 180;
 }
 
-/*
-  Approximate meters per degree at a given latitude.
-  Good enough for a terrain sampling box.
-*/
 function metersPerDegreeLat() {
   return 111320;
 }
@@ -40,122 +36,117 @@ function metersPerDegreeLon(lat) {
   return 111320 * Math.cos(degToRad(lat));
 }
 
-/*
-  Build a square bounding box centered on lat/lon.
-  scaleKm = width/height in kilometers.
-*/
 function makeBoundingBox(lat, lon, scaleKm) {
   const halfMeters = (scaleKm * 1000) / 2;
   const latDelta = halfMeters / metersPerDegreeLat();
   const lonDelta = halfMeters / metersPerDegreeLon(lat);
 
   return {
-    minLat: lat - latDelta,
-    maxLat: lat + latDelta,
-    minLon: lon - lonDelta,
-    maxLon: lon + lonDelta
+    south: lat - latDelta,
+    north: lat + latDelta,
+    west: lon - lonDelta,
+    east: lon + lonDelta
   };
 }
 
-/*
-  Standard slippy-map fractional tile coordinates.
-  Mapbox uses x/y tile numbering, not lat/lon directly.
-*/
-function lonToTileX(lon, zoom) {
-  const n = 2 ** zoom;
-  return ((lon + 180) / 360) * n;
+function buildOpenTopoUrl({ south, north, west, east, demType }) {
+  const params = new URLSearchParams({
+    demtype: demType,
+    south: String(south),
+    north: String(north),
+    west: String(west),
+    east: String(east),
+    outputFormat: "GTiff",
+    API_Key: OPENTOPOGRAPHY_API_KEY
+  });
+
+  return `https://portal.opentopography.org/API/globaldem?${params.toString()}`;
 }
 
-function latToTileY(lat, zoom) {
-  const latRad = degToRad(lat);
-  const n = 2 ** zoom;
-  return (
-    (1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2
-  ) * n;
-}
-
-/*
-  Mapbox Terrain-RGB decode formula:
-  height = -10000 + ((R * 256 * 256 + G * 256 + B) * 0.1)
-*/
-function decodeTerrainRgb(r, g, b) {
-  return -10000 + ((r * 256 * 256 + g * 256 + b) * 0.1);
-}
-
-/*
-  In-memory tile cache for prototype use.
-  Key = z/x/y
-*/
-const tileCache = new Map();
-
-async function fetchTilePng(z, x, y) {
-  const key = `${z}/${x}/${y}`;
-  if (tileCache.has(key)) {
-    return tileCache.get(key);
-  }
-
-  const url = `https://api.mapbox.com/v4/mapbox.terrain-rgb/${z}/${x}/${y}.pngraw?access_token=${MAPBOX_TOKEN}`;
+async function downloadGeoTiff(url) {
   const response = await fetch(url);
 
   if (!response.ok) {
-    throw new Error(`Failed tile fetch ${key}: ${response.status} ${response.statusText}`);
+    throw new Error(`OpenTopography request failed: ${response.status} ${response.statusText}`);
   }
 
   const arrayBuffer = await response.arrayBuffer();
-  const png = PNG.sync.read(Buffer.from(arrayBuffer));
-
-  tileCache.set(key, png);
-  return png;
+  return arrayBuffer;
 }
 
-async function getElevationAt(lat, lon, zoom) {
-  const tileXFloat = lonToTileX(lon, zoom);
-  const tileYFloat = latToTileY(lat, zoom);
+async function sampleGeoTiff(arrayBuffer, sampleCount) {
+  const tiff = await GeoTIFF.fromArrayBuffer(arrayBuffer);
+  const image = await tiff.getImage();
 
-  const tileX = Math.floor(tileXFloat);
-  const tileY = Math.floor(tileYFloat);
+  const width = image.getWidth();
+  const height = image.getHeight();
 
-  const png = await fetchTilePng(zoom, tileX, tileY);
+  const bbox = image.getBoundingBox(); // [minX, minY, maxX, maxY]
+  const [minX, minY, maxX, maxY] = bbox;
 
-  const pxFloat = (tileXFloat - tileX) * png.width;
-  const pyFloat = (tileYFloat - tileY) * png.height;
+  const rasters = await image.readRasters({ interleave: true });
+  const noData = image.getGDALNoData();
 
-  const px = clamp(Math.floor(pxFloat), 0, png.width - 1);
-  const py = clamp(Math.floor(pyFloat), 0, png.height - 1);
+  function getPixelValue(px, py) {
+    const x = clamp(Math.floor(px), 0, width - 1);
+    const y = clamp(Math.floor(py), 0, height - 1);
+    const idx = y * width + x;
 
-  const idx = (png.width * py + px) * 4;
-  const r = png.data[idx];
-  const g = png.data[idx + 1];
-  const b = png.data[idx + 2];
+    const value = rasters[idx];
 
-  return decodeTerrainRgb(r, g, b);
-}
+    if (value === undefined || value === null) return null;
+    if (Number.isFinite(noData) && value === noData) return null;
+    if (!Number.isFinite(value)) return null;
 
-async function buildHeightGrid(lat, lon, scaleKm, pointsPerKm, zoom) {
-  const bbox = makeBoundingBox(lat, lon, scaleKm);
+    return value;
+  }
 
-  const sampleCount = Math.max(2, Math.round(scaleKm * pointsPerKm));
   const heights = [];
 
   for (let row = 0; row < sampleCount; row++) {
     const rowHeights = [];
-    const tLat = sampleCount === 1 ? 0 : row / (sampleCount - 1);
-    const sampleLat = bbox.maxLat + (bbox.minLat - bbox.maxLat) * tLat;
+    const ty = sampleCount === 1 ? 0 : row / (sampleCount - 1);
+
+    // GeoTIFF bbox y increases upward, image row increases downward
+    const geoY = maxY - (maxY - minY) * ty;
+    const py = ((maxY - geoY) / (maxY - minY)) * (height - 1);
 
     for (let col = 0; col < sampleCount; col++) {
-      const tLon = sampleCount === 1 ? 0 : col / (sampleCount - 1);
-      const sampleLon = bbox.minLon + (bbox.maxLon - bbox.minLon) * tLon;
+      const tx = sampleCount === 1 ? 0 : col / (sampleCount - 1);
+      const geoX = minX + (maxX - minX) * tx;
+      const px = ((geoX - minX) / (maxX - minX)) * (width - 1);
 
-      const h = await getElevationAt(sampleLat, sampleLon, zoom);
-      rowHeights.push(Math.round(h * 10) / 10);
+      let value = getPixelValue(px, py);
+
+      // Very simple fallback for missing pixels:
+      if (value === null) {
+        const neighbors = [
+          getPixelValue(px - 1, py),
+          getPixelValue(px + 1, py),
+          getPixelValue(px, py - 1),
+          getPixelValue(px, py + 1)
+        ].filter(v => v !== null);
+
+        value = neighbors.length > 0
+          ? neighbors.reduce((a, b) => a + b, 0) / neighbors.length
+          : 0;
+      }
+
+      rowHeights.push(Math.round(value * 10) / 10);
     }
 
     heights.push(rowHeights);
   }
 
   return {
-    bbox,
-    sampleCount,
+    imageWidth: width,
+    imageHeight: height,
+    tiffBounds: {
+      minX,
+      minY,
+      maxX,
+      maxY
+    },
     heights
   };
 }
@@ -163,7 +154,7 @@ async function buildHeightGrid(lat, lon, scaleKm, pointsPerKm, zoom) {
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
-    message: "Roblox Terrain API running"
+    message: "OpenTopography Roblox height API is running"
   });
 });
 
@@ -173,6 +164,7 @@ app.get("/terrain", async (req, res) => {
     const lon = Number(req.query.lon);
     const scale = Number(req.query.scale || 1);
     const pointsPerKm = Number(req.query.pointsPerKm || DEFAULT_POINTS_PER_KM);
+    const demType = String(req.query.demType || DEFAULT_DEM);
 
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
       return res.status(400).json({ error: "lat and lon must be valid numbers" });
@@ -190,14 +182,16 @@ app.get("/terrain", async (req, res) => {
     const safeLon = ((lon + 180) % 360 + 360) % 360 - 180;
     const safeScale = clamp(scale, 0.25, 20);
     const safePointsPerKm = clamp(pointsPerKm, 2, 50);
+    const sampleCount = Math.max(2, Math.round(safeScale * safePointsPerKm));
 
-    const result = await buildHeightGrid(
-      safeLat,
-      safeLon,
-      safeScale,
-      safePointsPerKm,
-      TILE_ZOOM
-    );
+    const bbox = makeBoundingBox(safeLat, safeLon, safeScale);
+    const url = buildOpenTopoUrl({
+      ...bbox,
+      demType
+    });
+
+    const geoTiffBuffer = await downloadGeoTiff(url);
+    const sampled = await sampleGeoTiff(geoTiffBuffer, sampleCount);
 
     res.json({
       ok: true,
@@ -207,10 +201,14 @@ app.get("/terrain", async (req, res) => {
       },
       scaleKm: safeScale,
       pointsPerKm: safePointsPerKm,
-      zoom: TILE_ZOOM,
-      bbox: result.bbox,
-      sampleCount: result.sampleCount,
-      heights: result.heights
+      sampleCount,
+      demType,
+      bbox,
+      heights: sampled.heights,
+      sourceImage: {
+        width: sampled.imageWidth,
+        height: sampled.imageHeight
+      }
     });
   } catch (error) {
     console.error(error);
@@ -225,4 +223,3 @@ app.get("/terrain", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
 });
-
