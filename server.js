@@ -12,13 +12,14 @@ if (!OPENTOPOGRAPHY_API_KEY) {
   throw new Error("Missing OPENTOPOGRAPHY_API_KEY in environment variables.");
 }
 
-const DEFAULT_POINTS_PER_KM = 10;
-
-// Pick a DEM source.
-// Good starter choice:
-// SRTMGL3 = coarser global
-// SRTMGL1 = finer where available
 const DEFAULT_DEM = "SRTMGL1";
+
+/*
+  IMPORTANT:
+  This is now FIXED.
+  No matter what scale is, we always return the same grid size.
+*/
+const FIXED_SAMPLE_COUNT = 64;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
@@ -36,6 +37,11 @@ function metersPerDegreeLon(lat) {
   return 111320 * Math.cos(degToRad(lat));
 }
 
+/*
+  scale = kilometers of real-world terrain to capture
+  Example:
+  scale=1.5 => 1.5km x 1.5km area
+*/
 function makeBoundingBox(lat, lon, scaleKm) {
   const halfMeters = (scaleKm * 1000) / 2;
   const latDelta = halfMeters / metersPerDegreeLat();
@@ -70,8 +76,7 @@ async function downloadGeoTiff(url) {
     throw new Error(`OpenTopography request failed: ${response.status} ${response.statusText}`);
   }
 
-  const arrayBuffer = await response.arrayBuffer();
-  return arrayBuffer;
+  return await response.arrayBuffer();
 }
 
 async function sampleGeoTiff(arrayBuffer, sampleCount) {
@@ -81,7 +86,7 @@ async function sampleGeoTiff(arrayBuffer, sampleCount) {
   const width = image.getWidth();
   const height = image.getHeight();
 
-  const bbox = image.getBoundingBox(); // [minX, minY, maxX, maxY]
+  const bbox = image.getBoundingBox();
   const [minX, minY, maxX, maxY] = bbox;
 
   const rasters = await image.readRasters({ interleave: true });
@@ -105,20 +110,18 @@ async function sampleGeoTiff(arrayBuffer, sampleCount) {
 
   for (let row = 0; row < sampleCount; row++) {
     const rowHeights = [];
-    const ty = sampleCount === 1 ? 0 : row / (sampleCount - 1);
+    const ty = row / (sampleCount - 1);
 
-    // GeoTIFF bbox y increases upward, image row increases downward
     const geoY = maxY - (maxY - minY) * ty;
     const py = ((maxY - geoY) / (maxY - minY)) * (height - 1);
 
     for (let col = 0; col < sampleCount; col++) {
-      const tx = sampleCount === 1 ? 0 : col / (sampleCount - 1);
+      const tx = col / (sampleCount - 1);
       const geoX = minX + (maxX - minX) * tx;
       const px = ((geoX - minX) / (maxX - minX)) * (width - 1);
 
       let value = getPixelValue(px, py);
 
-      // Very simple fallback for missing pixels:
       if (value === null) {
         const neighbors = [
           getPixelValue(px - 1, py),
@@ -132,7 +135,7 @@ async function sampleGeoTiff(arrayBuffer, sampleCount) {
           : 0;
       }
 
-      rowHeights.push(Math.round(value * 10) / 10);
+      rowHeights.push(Math.round(value));
     }
 
     heights.push(rowHeights);
@@ -141,12 +144,6 @@ async function sampleGeoTiff(arrayBuffer, sampleCount) {
   return {
     imageWidth: width,
     imageHeight: height,
-    tiffBounds: {
-      minX,
-      minY,
-      maxX,
-      maxY
-    },
     heights
   };
 }
@@ -162,8 +159,7 @@ app.get("/terrain", async (req, res) => {
   try {
     const lat = Number(req.query.lat);
     const lon = Number(req.query.lon);
-    const scale = Number(req.query.scale || 1);
-    const pointsPerKm = Number(req.query.pointsPerKm || DEFAULT_POINTS_PER_KM);
+    const scale = Number(req.query.scale || 1.5);
     const demType = String(req.query.demType || DEFAULT_DEM);
 
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
@@ -174,24 +170,19 @@ app.get("/terrain", async (req, res) => {
       return res.status(400).json({ error: "scale must be a positive number" });
     }
 
-    if (!Number.isFinite(pointsPerKm) || pointsPerKm <= 0) {
-      return res.status(400).json({ error: "pointsPerKm must be a positive number" });
-    }
-
     const safeLat = clamp(lat, -85, 85);
     const safeLon = ((lon + 180) % 360 + 360) % 360 - 180;
     const safeScale = clamp(scale, 0.25, 20);
-    const safePointsPerKm = clamp(pointsPerKm, 2, 50);
-    const sampleCount = Math.max(2, Math.round(safeScale * safePointsPerKm));
 
     const bbox = makeBoundingBox(safeLat, safeLon, safeScale);
+
     const url = buildOpenTopoUrl({
       ...bbox,
       demType
     });
 
     const geoTiffBuffer = await downloadGeoTiff(url);
-    const sampled = await sampleGeoTiff(geoTiffBuffer, sampleCount);
+    const sampled = await sampleGeoTiff(geoTiffBuffer, FIXED_SAMPLE_COUNT);
 
     res.json({
       ok: true,
@@ -200,9 +191,8 @@ app.get("/terrain", async (req, res) => {
         lon: safeLon
       },
       scaleKm: safeScale,
-      pointsPerKm: safePointsPerKm,
-      sampleCount,
       demType,
+      sampleCount: FIXED_SAMPLE_COUNT,
       bbox,
       heights: sampled.heights,
       sourceImage: {
